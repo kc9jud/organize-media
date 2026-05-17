@@ -95,3 +95,16 @@ Both tables in same SQLite file. WAL mode enabled.
 - Concurrent independent invocations targeting same DEST are safe (atomic primitives handle races) but may produce gaps in NNNN sequence.
 - `(None, size)` sentinel groups may produce "same content" matches between EXIF-failed files with no timestamp relationship — correct but potentially noisy.
 - Target filesystem is ZFS on Linux; same-pool copies between datasets benefit from reflink.
+
+## Subagents v1.0
+
+Spawn subagents to isolate context, parallelize independent work, or offload bulk mechanical tasks. Don't spawn when the parent needs the reasoning, when synthesis requires holding things together, or when spawn overhead dominates.
+
+Pick the cheapest model that can do the subtask well:
+- Haiku: bulk mechanical work, no judgment
+- Sonnet: scoped research, code exploration, in-scope synthesis
+- Opus: subtasks needing real planning or tradeoffs
+
+If a subagent realizes it needs a higher tier than itself, return to the parent.
+
+Parent owns final output and cross-spawn synthesis. User instructions override.
