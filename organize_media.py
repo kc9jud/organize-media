@@ -90,15 +90,30 @@ class ExifCache:
         self._write_conn = write_conn
         self._write_lock = write_lock
         self._local      = threading.local()
+        self._read_conns: list[sqlite3.Connection] = []
+        self._conns_lock = threading.Lock()
         with self._write_lock:
             self._write_conn.execute(self._DDL)
 
     def _read_conn(self) -> sqlite3.Connection:
         """Return this thread's read connection, opening it on first use."""
         if not hasattr(self._local, "conn"):
-            self._local.conn = sqlite3.connect(self._db_path, check_same_thread=False)
-            self._local.conn.execute("PRAGMA journal_mode=WAL")
+            conn = sqlite3.connect(self._db_path, check_same_thread=False)
+            conn.execute("PRAGMA journal_mode=WAL")
+            self._local.conn = conn
+            with self._conns_lock:
+                self._read_conns.append(conn)
         return self._local.conn
+
+    def close_read_conns(self) -> None:
+        """Close all per-thread read connections opened by this cache."""
+        with self._conns_lock:
+            for conn in self._read_conns:
+                try:
+                    conn.close()
+                except sqlite3.Error:
+                    pass
+            self._read_conns.clear()
 
     # ── public interface ──────────────────────────────────────────────────────
 
@@ -260,6 +275,9 @@ class NullExifCache(ExifCache):
     def commit(self) -> None:
         pass
 
+    def close_read_conns(self) -> None:
+        pass
+
 
 # ── hash cache ────────────────────────────────────────────────────────────────
 
@@ -289,15 +307,30 @@ class HashCache:
         self._write_conn = write_conn
         self._write_lock = write_lock
         self._local      = threading.local()
+        self._read_conns: list[sqlite3.Connection] = []
+        self._conns_lock = threading.Lock()
         with self._write_lock:
             self._write_conn.execute(self._DDL)
 
     def _read_conn(self) -> sqlite3.Connection:
         """Return this thread's read connection, opening it on first use."""
         if not hasattr(self._local, "conn"):
-            self._local.conn = sqlite3.connect(self._db_path, check_same_thread=False)
-            self._local.conn.execute("PRAGMA journal_mode=WAL")
+            conn = sqlite3.connect(self._db_path, check_same_thread=False)
+            conn.execute("PRAGMA journal_mode=WAL")
+            self._local.conn = conn
+            with self._conns_lock:
+                self._read_conns.append(conn)
         return self._local.conn
+
+    def close_read_conns(self) -> None:
+        """Close all per-thread read connections opened by this cache."""
+        with self._conns_lock:
+            for conn in self._read_conns:
+                try:
+                    conn.close()
+                except sqlite3.Error:
+                    pass
+            self._read_conns.clear()
 
     # ── public interface ──────────────────────────────────────────────────────
 
@@ -370,6 +403,9 @@ class NullCache(HashCache):
         pass
 
     def commit(self) -> None:
+        pass
+
+    def close_read_conns(self) -> None:
         pass
 
 
@@ -735,7 +771,7 @@ def organize(
                 pool.submit(read_exif, p, size, progress, task, label)
                 for p, size in sorted(items)
             ]
-            reduce_exif([fut.result() for fut in futures])
+            reduce_exif([fut.result() for fut in as_completed(futures)])
 
     # ── phase 3: EXIF for exclude files sharing a collision size ─────────────
     excl_collision_files: list[tuple[Path, int]] = [
@@ -1049,7 +1085,7 @@ def main() -> None:
                     dry_run=args.dry_run,
                     verbose=args.verbose,
                     pool=pool,
-                    cache=hash_cache,
+                    hash_cache=hash_cache,
                     exif_cache=exif_cache,
                 )
             else:
@@ -1061,10 +1097,12 @@ def main() -> None:
                     verbose=args.verbose,
                     exclude_dirs=args.exclude,
                     pool=pool,
-                    cache=hash_cache,
+                    hash_cache=hash_cache,
                     exif_cache=exif_cache,
                 )
         finally:
+            hash_cache.close_read_conns()
+            exif_cache.close_read_conns()
             if write_conn is not None:
                 write_conn.commit()
                 write_conn.close()
