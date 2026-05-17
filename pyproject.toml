@@ -1,0 +1,22 @@
+[project]
+name = "organize-media"
+version = "0.0.0"
+requires-python = ">=3.12"
+dependencies = [
+    "pillow",
+    "exifread",
+    "hachoir",
+    "rich",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=8",
+    "pytest-timeout",
+    "piexif",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths  = ["tests"]
+timeout    = 30

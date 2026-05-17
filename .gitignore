@@ -218,3 +218,7 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Test fixture raw inputs — not committed; executor derives fixtures from these
+tests/fixtures/_raw/
+
