@@ -18,6 +18,7 @@ import os
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import threading
 from collections import defaultdict
 from collections.abc import Callable
@@ -411,45 +412,152 @@ class NullCache(HashCache):
 
 # ── destination path builder ──────────────────────────────────────────────────
 
-def reflink_copy(src: Path, dst: Path) -> bool:
-    """
-    Attempt an atomic reflink copy using cp --no-clobber --reflink=auto
-    --preserve=all.  Returns True on success, False if dst already existed
-    (lost the race), raises subprocess.CalledProcessError on other failures.
+# ── no-clobber primitive factory ──────────────────────────────────────────────
+# Atomic destination-claim with adaptive strategy.  Order of preference:
+#
+#   1. Native cp/mv no-clobber flags whose skip semantics we can detect
+#      from rc + stderr alone — preserves renameat2(RENAME_NOREPLACE)
+#      atomicity for mv and avoids a placeholder file for cp.
+#         (--update=none-fail, "not replacing")  ← coreutils 9.5+
+#         (--no-clobber,       "not replacing")  ← mv 9.4 and similar
+#         (--no-clobber,       None)             ← pre-9.4 "rc!=0 empty stderr"
+#
+#   2. O_EXCL pre-claim fallback when no flag passes the probe.  Python
+#      atomically creates an empty placeholder at dst; the winning thread
+#      then overwrites it with `cp -f` / `mv -f`.  Used only as a last
+#      resort because it loses renameat2 atomicity and briefly exposes an
+#      empty file to outside observers.
+#
+# The probe runs once per make_primitive() call.  GNU coreutils 9.4
+# specifically broke flag-only detection for cp: both `--no-clobber` and
+# `--update=none` return rc=0 silently on skip (cp 9.4 emits only a
+# portability warning).  That's why the fallback exists.
+
+
+_STRATEGIES: tuple[tuple[tuple[str, ...], str | None], ...] = (
+    (("--update=none-fail",), "not replacing"),
+    (("--no-clobber",),       "not replacing"),
+    (("--no-clobber",),       None),
+)
+
+
+def _invoke(tool: str, flags: tuple[str, ...], extra: tuple[str, ...],
+            skip_marker: str | None, src: Path, dst: Path) -> bool:
+    """Run `tool <flags> <extra> -- src dst`, interpret the result.
+
+    Returns True on success, False on benign skip, raises CalledProcessError
+    on real failure.  `skip_marker` None means "empty stderr (with rc != 0)
+    is the skip signal" — the convention older `--no-clobber` followed.
     """
     result = subprocess.run(
-        ["cp", "--no-clobber", "--reflink=auto", "--preserve=all", "--", str(src), str(dst)],
-        capture_output=True,
+        [tool, *flags, *extra, "--", str(src), str(dst)],
+        capture_output=True, text=True,
     )
     if result.returncode == 0:
         return True
-    if not result.stderr.strip():
+    is_skip = (not result.stderr.strip()
+               if skip_marker is None
+               else skip_marker in result.stderr)
+    if is_skip:
         return False
-    raise subprocess.CalledProcessError(result.returncode, result.args, result.stderr)
+    raise subprocess.CalledProcessError(
+        result.returncode, result.args, result.stderr)
 
 
-def mv_no_clobber(src: Path, dst: Path) -> bool:
+def _probe(tool: str, extra: tuple[str, ...]
+           ) -> tuple[tuple[str, ...], str | None] | None:
+    """Return the first (flags, skip_marker) that gives correct no-clobber
+    semantics for `tool`, or None if none qualifies.
+
+    Phase 1 (non-collision): _invoke returns True, dst has src's bytes.
+    Phase 2 (collision):     _invoke returns False, dst bytes unchanged.
     """
-    Attempt an atomic no-clobber rename using mv --no-clobber.  On modern
-    Linux this issues renameat2(RENAME_NOREPLACE) — a single atomic syscall
-    with no TOCTOU gap.  Returns True on success, False if dst already existed
-    (lost the race), raises subprocess.CalledProcessError on other failures.
+    with tempfile.TemporaryDirectory(prefix="organize_media_probe_") as td:
+        td_path = Path(td)
+        for flags, marker in _STRATEGIES:
+            src = td_path / "src"
+            dst = td_path / "dst"
+            try:
+                src.write_bytes(b"NEW")
+                if dst.exists():
+                    dst.unlink()
+                ok = _invoke(tool, flags, extra, marker, src, dst)
+                if not (ok and dst.exists() and dst.read_bytes() == b"NEW"):
+                    continue
 
-    Used in move mode (both organize --move and reorganize).  For same-
-    filesystem moves this is a single atomic rename; for cross-filesystem moves
-    mv falls back to a reflink copy + unlink, which is equivalent to what
-    reflink_copy + unlink would do but with the added benefit that mv cleans up
-    a partial destination file on failure.
+                src.write_bytes(b"NEW2")
+                dst.write_bytes(b"ORIGINAL")
+                ok = _invoke(tool, flags, extra, marker, src, dst)
+                if ok or dst.read_bytes() != b"ORIGINAL":
+                    continue
+
+                return flags, marker
+            except (subprocess.CalledProcessError, FileNotFoundError):
+                continue
+            finally:
+                for p in (src, dst):
+                    if p.exists():
+                        p.unlink()
+    return None
+
+
+def make_primitive(move: bool) -> Callable[[Path, Path], bool]:
+    """Build a (src, dst) -> bool primitive for use with claim_dest_path.
+
+    Probes cp/mv for a no-clobber flag with detectable skip semantics
+    (preferred — preserves renameat2 atomicity for mv).  Falls back to an
+    O_EXCL placeholder + `-f` overwrite when no flag passes the probe
+    (e.g. cp 9.4, where every no-clobber flag returns rc=0 silently).
+
+    Callers invoke this from a single-threaded region (top of organize /
+    reorganize), then pass the returned closure as `primitive=` into
+    claim_dest_path; the closure is safe to call concurrently from the
+    thread pool.
+
+    Returns True on success, False on benign skip (lost the race), raises
+    subprocess.CalledProcessError on real failures.  In fallback mode, a
+    failed `cp -f`/`mv -f` unlinks the placeholder before re-raising.
     """
-    result = subprocess.run(
-        ["mv", "--no-clobber", "--", str(src), str(dst)],
-        capture_output=True,
-    )
-    if result.returncode == 0:
-        return True
-    if not result.stderr.strip():
-        return False
-    raise subprocess.CalledProcessError(result.returncode, result.args, result.stderr)
+    if move:
+        tool = "mv"
+        extra: tuple[str, ...] = ()
+    else:
+        tool = "cp"
+        extra = ("--reflink=auto", "--preserve=all")
+
+    chosen = _probe(tool, extra)
+    if chosen is not None:
+        flags, marker = chosen
+
+        def primitive(src: Path, dst: Path) -> bool:
+            return _invoke(tool, flags, extra, marker, src, dst)
+
+        return primitive
+
+    # Fallback: O_EXCL pre-claim + plain cp/mv with -f to overwrite the
+    # empty placeholder we just created.
+    cmd_flags: tuple[str, ...] = ("-f", *extra)
+
+    def primitive(src: Path, dst: Path) -> bool:
+        try:
+            fd = os.open(str(dst), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+        except FileExistsError:
+            return False
+        os.close(fd)
+        try:
+            subprocess.run(
+                [tool, *cmd_flags, "--", str(src), str(dst)],
+                capture_output=True, text=True, check=True,
+            )
+            return True
+        except subprocess.CalledProcessError:
+            try:
+                dst.unlink()
+            except OSError:
+                pass
+            raise
+
+    return primitive
 
 
 def claim_dest_path(
@@ -457,16 +565,16 @@ def claim_dest_path(
     dt: datetime,
     src: Path,
     *,
-    primitive: Callable[[Path, Path], bool] = reflink_copy,
+    primitive: Callable[[Path, Path], bool],
     dry_run: bool = False,
 ) -> Path:
     """
     Find a free destination path and atomically claim it.
 
-    `primitive` is called as primitive(src, candidate) and must return True on
-    success or False if the slot was already taken (lost a concurrent race), in
-    which case the next NNNN is tried.  Defaults to reflink_copy (copy mode);
-    pass mv_no_clobber for move mode (both organize --move and reorganize).
+    `primitive` is required and is called as primitive(src, candidate); it
+    must return True on success or False if the slot was already taken (lost
+    a concurrent race), in which case the next NNNN is tried.  Callers
+    build a primitive once per run via `make_primitive(move=…)`.
 
     Probes from n=1 on every call — no counter state is maintained, so this
     function is safe to call concurrently from multiple threads.  The exists()
@@ -677,6 +785,10 @@ def organize(
     hash_cache: HashCache,
     exif_cache: ExifCache,
 ) -> None:
+    # Probe and build the no-clobber primitive once, before the thread pool
+    # starts — this is the only single-threaded region, so no lock is needed.
+    primitive = make_primitive(move=move)
+
     # ── phase 1: stat sweep ───────────────────────────────────────────────────
     # Collect (path, size) for source and exclude files cheaply — no EXIF yet.
     src_items = collect_media(sources)
@@ -804,7 +916,6 @@ def organize(
     # ── phase 6: copy / move ──────────────────────────────────────────────────
     ok = errors = skipped = 0
     action_label = "Moving" if move else "Copying"
-    primitive = mv_no_clobber if move else reflink_copy
 
     CopyResult = tuple[Path, Path | None, Exception | None]
 
@@ -892,12 +1003,16 @@ def reorganize(
     match its EXIF datetime into the correct location.
 
     Unlike organize(), every file needs its EXIF timestamp (to compute its
-    correct path), so there is no deferred-EXIF optimisation.  Moves use
-    mv --no-clobber, which on modern Linux issues renameat2(RENAME_NOREPLACE)
+    correct path), so there is no deferred-EXIF optimisation.  The move
+    primitive is built once via `make_primitive(move=True)` before the
+    thread pool starts; on modern Linux mv issues renameat2(RENAME_NOREPLACE)
     — a single atomic syscall that is O(1) on the same filesystem and safe
     under concurrent writers.  Empty directories left behind after moves are
     pruned.
     """
+    # Probe and build the move primitive once, before the thread pool starts.
+    primitive = make_primitive(move=True)
+
     items = collect_media([dest])
     if not items:
         console.print("No media files found in destination.")
@@ -967,7 +1082,7 @@ def reorganize(
         try:
             sha1      = hash_cache.get(src, dt, src_size[src]) if not dry_run else None
             candidate = claim_dest_path(dest, dt, src,
-                                        primitive=mv_no_clobber, dry_run=dry_run)
+                                        primitive=primitive, dry_run=dry_run)
             if not dry_run:
                 exif_cache.put(candidate, dt)
                 hash_cache.put(candidate, sha1, dt, candidate.stat().st_size)

@@ -1,7 +1,7 @@
-"""Tests for reflink_copy and mv_no_clobber subprocess primitives.
+"""Tests for the `make_primitive` factory and the closures it returns.
 
-Exercises the real `cp` and `mv` binaries (Linux GNU coreutils). No mocking.
-Covers organize_media.py:414-452.
+Exercises real `cp` and `mv` (Linux GNU coreutils).  No mocking of the
+subprocess layer.  Covers organize_media.py's no-clobber primitive section.
 """
 
 from __future__ import annotations
@@ -13,68 +13,71 @@ from pathlib import Path
 
 import pytest
 
-from organize_media import mv_no_clobber, reflink_copy
+from organize_media import make_primitive
+
+
+# Module-scope primitives so the probe / closure construction runs once
+# per file, not once per test.
+@pytest.fixture(scope="module")
+def copy_primitive():
+    return make_primitive(move=False)
+
+
+@pytest.fixture(scope="module")
+def move_primitive():
+    return make_primitive(move=True)
 
 
 # ---------------------------------------------------------------------------
-# reflink_copy
+# copy
 # ---------------------------------------------------------------------------
 
 
-def test_reflink_copy_happy_path(write_bytes, tmp_path: Path) -> None:
+def test_copy_happy_path(copy_primitive, write_bytes, tmp_path: Path) -> None:
     src = write_bytes("src.bin", b"hello")
     os.chmod(src, 0o640)
     dst = tmp_path / "dst.bin"
 
-    result = reflink_copy(src, dst)
+    result = copy_primitive(src, dst)
 
     assert result is True
     assert dst.exists()
     assert dst.read_bytes() == b"hello"
-    # --preserve=all should carry mode bits across (regardless of reflink vs full copy).
+    # --preserve=all carries mode bits across (regardless of reflink vs full copy).
     assert stat.S_IMODE(dst.stat().st_mode) == 0o640
 
 
-@pytest.mark.xfail(
-    reason=(
-        "GNU coreutils 9.4 changed `cp --no-clobber` behaviour: instead of "
-        "returning rc=0 silently or rc=1 on skip, it now ALWAYS returns rc=0 "
-        "and emits only a portability-warning on stderr ('behavior of -n is "
-        "non-portable…').  `reflink_copy` reads rc=0 as success and returns "
-        "True even when no copy occurred.  Production fix: use "
-        "`--update=none-fail` (cp 9.4+), or compare src/dst inodes after."
-    ),
-    strict=True,
-)
-def test_reflink_copy_no_clobber_lost_race(write_bytes, tmp_path: Path) -> None:
+def test_copy_collision_returns_false(copy_primitive, write_bytes, tmp_path: Path) -> None:
     src = write_bytes("src.bin", b"new-content")
     dst = write_bytes("dst.bin", b"original-content")
 
-    result = reflink_copy(src, dst)
+    result = copy_primitive(src, dst)
 
     assert result is False
     # dst must not have been overwritten with src bytes.
     assert dst.read_bytes() == b"original-content"
 
 
-def test_reflink_copy_failure_missing_src(tmp_path: Path) -> None:
+def test_copy_failure_missing_src(copy_primitive, tmp_path: Path) -> None:
     missing_src = tmp_path / "does_not_exist.bin"
     dst = tmp_path / "dst.bin"
 
     with pytest.raises(subprocess.CalledProcessError):
-        reflink_copy(missing_src, dst)
+        copy_primitive(missing_src, dst)
+    # The O_EXCL placeholder must be cleaned up after a failed copy.
+    assert not dst.exists()
 
 
 # ---------------------------------------------------------------------------
-# mv_no_clobber
+# move
 # ---------------------------------------------------------------------------
 
 
-def test_mv_no_clobber_happy_path(write_bytes, tmp_path: Path) -> None:
+def test_move_happy_path(move_primitive, write_bytes, tmp_path: Path) -> None:
     src = write_bytes("src.bin", b"hello")
     dst = tmp_path / "dst.bin"
 
-    result = mv_no_clobber(src, dst)
+    result = move_primitive(src, dst)
 
     assert result is True
     assert not src.exists()
@@ -82,23 +85,11 @@ def test_mv_no_clobber_happy_path(write_bytes, tmp_path: Path) -> None:
     assert dst.read_bytes() == b"hello"
 
 
-@pytest.mark.xfail(
-    reason=(
-        "GNU coreutils 9.4 changed `mv --no-clobber` behaviour: it now returns "
-        "rc=1 with stderr 'mv: not replacing X' on skip (older versions "
-        "returned rc=0 silently).  `mv_no_clobber` reads (rc!=0, stderr "
-        "non-empty) as a real failure and raises CalledProcessError instead "
-        "of returning False.  Production fix: detect the 'not replacing' "
-        "stderr pattern as a benign skip, or switch to `--update=none-fail`."
-    ),
-    strict=True,
-    raises=subprocess.CalledProcessError,
-)
-def test_mv_no_clobber_lost_race(write_bytes, tmp_path: Path) -> None:
+def test_move_collision_returns_false(move_primitive, write_bytes, tmp_path: Path) -> None:
     src = write_bytes("src.bin", b"aaaa")
     dst = write_bytes("dst.bin", b"bbbb")
 
-    result = mv_no_clobber(src, dst)
+    result = move_primitive(src, dst)
 
     assert result is False
     # src untouched.
@@ -108,9 +99,48 @@ def test_mv_no_clobber_lost_race(write_bytes, tmp_path: Path) -> None:
     assert dst.read_bytes() == b"bbbb"
 
 
-def test_mv_no_clobber_failure_missing_src(tmp_path: Path) -> None:
+def test_move_failure_missing_src(move_primitive, tmp_path: Path) -> None:
     missing_src = tmp_path / "does_not_exist.bin"
     dst = tmp_path / "dst.bin"
 
     with pytest.raises(subprocess.CalledProcessError):
-        mv_no_clobber(missing_src, dst)
+        move_primitive(missing_src, dst)
+    # Placeholder cleaned up.
+    assert not dst.exists()
+
+
+# ---------------------------------------------------------------------------
+# factory shape
+# ---------------------------------------------------------------------------
+
+
+def test_make_primitive_returns_distinct_closures():
+    """Each call returns a new closure; the move flag selects cp vs mv."""
+    a = make_primitive(move=False)
+    b = make_primitive(move=False)
+    c = make_primitive(move=True)
+    assert a is not b
+    assert a is not c
+
+
+def test_copy_primitive_passable_to_claim_dest_path(tmp_path, write_bytes) -> None:
+    """A primitive built by make_primitive satisfies claim_dest_path's contract."""
+    from datetime import datetime
+    from organize_media import claim_dest_path
+
+    src = write_bytes("src.jpg", b"x")
+    dest = tmp_path / "dest"
+    out = claim_dest_path(dest, datetime(2020, 1, 1, 0, 0, 0), src,
+                          primitive=make_primitive(move=False))
+    assert out.exists() and out.read_bytes() == b"x"
+
+
+def test_move_primitive_passable_to_claim_dest_path(tmp_path, write_bytes) -> None:
+    from datetime import datetime
+    from organize_media import claim_dest_path
+
+    src = write_bytes("src.jpg", b"y")
+    dest = tmp_path / "dest"
+    out = claim_dest_path(dest, datetime(2021, 2, 2, 1, 1, 1), src,
+                          primitive=make_primitive(move=True))
+    assert out.exists() and not src.exists()

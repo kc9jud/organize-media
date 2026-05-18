@@ -261,16 +261,6 @@ def test_implicit_exclude_from_existing_dest(
     )
 
 
-@pytest.mark.xfail(
-    reason=(
-        "Production bug: under coreutils 9.4 `cp --no-clobber` silently "
-        "returns rc=0 on skip, so `reflink_copy` reports success without "
-        "actually copying.  When two source files race onto the same dest "
-        "path, only one lands; the other is silently lost.  See xfail in "
-        "test_claim_dest_path.test_concurrent_claim for fix sketch."
-    ),
-    strict=True,
-)
 def test_nnnn_collision(
     tmp_path, dest, make_jpeg, null_caches, pool, captured_console
 ):

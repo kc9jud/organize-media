@@ -30,7 +30,7 @@ No build step. No test suite. No lint config.
 pip install pillow exifread hachoir rich
 ```
 
-**Linux only.** Uses GNU `cp --reflink=auto --no-clobber` and `mv --no-clobber`. BSD/macOS coreutils not compatible.
+**Linux only.** Uses GNU `cp` and `mv`. The no-clobber semantics are chosen at runtime by `make_primitive`, which probes flag candidates in this order: `--update=none-fail` (coreutils 9.5+), `--no-clobber` with "not replacing" stderr (mv 9.4 and similar), `--no-clobber` with empty-stderr-rc!=0 (pre-9.4). If no flag-only strategy passes the probe — notably **cp on coreutils 9.4**, where every no-clobber flag returns rc=0 silently — the factory falls back to an `O_EXCL` pre-claim plus `cp -f` / `mv -f` overwriting the empty placeholder. BSD/macOS coreutils not compatible.
 
 ## Architecture
 
@@ -44,7 +44,7 @@ Single file, ~1000 lines. Key sections:
 
 **`claim_dest_path()` (`:419`)** — Atomically reserves a destination path by racing with `O_CREAT|O_EXCL`, appending `_NNNN` counter on collision.
 
-**`reflink_copy()` (`:378`)** — Delegates to `cp --reflink=auto --no-clobber` for CoW on supported filesystems.
+**`make_primitive(move)` (no-clobber primitive factory)** — Returns a `(src, dst) -> bool` closure for use as `claim_dest_path`'s `primitive=`. Probes for a working no-clobber flag (preferring `--update=none-fail`, then `--no-clobber` variants); falls back to `O_EXCL` pre-claim + `cp -f` / `mv -f` when no flag works (cp 9.4 case). `cp` mode also passes `--reflink=auto --preserve=all` for CoW on supported filesystems. `organize()` and `reorganize()` each call `make_primitive` exactly once at entry, before the thread pool spins up, so no lock is needed around the probe.
 
 ## Output Filename Format
 
@@ -72,9 +72,9 @@ Pillow Exif Sub-IFD (`DateTimeOriginal` 0x9003, `DateTimeDigitized` 0x9004) → 
 
 **Deduplication key:** `(datetime, size)` — different sizes never hash against each other. EXIF-failed files use `(None, size)` sentinel and bypass hash cache.
 
-**`claim_dest_path()` race safety:** probes from `n=1` each call (no shared counter state). `cp --no-clobber` is atomic; lost race returns false (empty stderr, non-zero exit), caller increments NNNN and retries. Raises `RuntimeError` after 10,000 attempts.
+**`claim_dest_path()` race safety:** probes from `n=1` each call (no shared counter state). The primitive returned by `make_primitive` provides the atomicity guarantee — either via a no-clobber cp/mv flag, or via an `O_EXCL` placeholder open in the fallback path. A lost race returns False; the caller increments NNNN and retries. Raises `RuntimeError` after 10,000 attempts.
 
-**`mv --no-clobber` vs `cp` + unlink:** `mv` uses `renameat2(RENAME_NOREPLACE)` for same-filesystem moves (atomic, no TOCTOU). For cross-filesystem, GNU `mv` also uses `REFLINK_AUTO` in its copy fallback — strictly better than manual `cp` + `unlink`.
+**`mv` vs `cp` + unlink:** when a no-clobber flag passes the probe, `mv` uses `renameat2(RENAME_NOREPLACE)` for same-filesystem moves (atomic, no TOCTOU). For cross-filesystem, GNU `mv` also uses `REFLINK_AUTO` in its copy fallback — strictly better than manual `cp` + `unlink`. In the `O_EXCL` fallback path the renameat2 atomicity is lost, but for `organize_media`'s single-writer-per-dst use case the placeholder window is benign.
 
 **Post-copy cache:** after successful copy, `cache.get(src)` (cache hit for dedup-group members, miss+compute for singletons) then `cache.put(dst)` — future runs recognize already-copied files without re-hashing.
 

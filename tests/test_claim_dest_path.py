@@ -1,4 +1,4 @@
-"""Tests for organize_media.claim_dest_path (lines 455-493)."""
+"""Tests for organize_media.claim_dest_path."""
 
 from __future__ import annotations
 
@@ -8,16 +8,22 @@ from pathlib import Path
 
 import pytest
 
-from organize_media import claim_dest_path
+from organize_media import claim_dest_path, make_primitive
 
 
 DT = datetime(2020, 6, 15, 12, 30, 45)
 
 
-def test_basic_placement(dest: Path, write_bytes) -> None:
-    """Default reflink_copy primitive places file at 2020/06/...0001.jpg."""
+@pytest.fixture(scope="module")
+def copy_primitive():
+    """Build a cp-based primitive once per module; reused across tests."""
+    return make_primitive(move=False)
+
+
+def test_basic_placement(dest: Path, write_bytes, copy_primitive) -> None:
+    """Real copy primitive places file at 2020/06/...0001.jpg."""
     src = write_bytes("src.jpg", data=b"hello world")
-    result = claim_dest_path(dest, DT, src)
+    result = claim_dest_path(dest, DT, src, primitive=copy_primitive)
 
     expected = dest / "2020" / "06" / "2020-06-15 12-30-45 0001.jpg"
     assert result == expected
@@ -25,7 +31,7 @@ def test_basic_placement(dest: Path, write_bytes) -> None:
     assert result.read_bytes() == b"hello world"
 
 
-def test_nnnn_increment(dest: Path, write_bytes) -> None:
+def test_nnnn_increment(dest: Path, write_bytes, copy_primitive) -> None:
     """Pre-existing 0001 and 0002 cause the function to return 0003."""
     src = write_bytes("src.jpg", data=b"payload")
     month_dir = dest / "2020" / "06"
@@ -33,7 +39,7 @@ def test_nnnn_increment(dest: Path, write_bytes) -> None:
     (month_dir / "2020-06-15 12-30-45 0001.jpg").write_bytes(b"")
     (month_dir / "2020-06-15 12-30-45 0002.jpg").write_bytes(b"")
 
-    result = claim_dest_path(dest, DT, src)
+    result = claim_dest_path(dest, DT, src, primitive=copy_primitive)
 
     expected = month_dir / "2020-06-15 12-30-45 0003.jpg"
     assert result == expected
@@ -41,12 +47,12 @@ def test_nnnn_increment(dest: Path, write_bytes) -> None:
     assert result.read_bytes() == b"payload"
 
 
-def test_dry_run(dest: Path, write_bytes) -> None:
+def test_dry_run(dest: Path, write_bytes, copy_primitive) -> None:
     """dry_run=True returns candidate path with no filesystem side effects."""
     src = write_bytes("src.jpg", data=b"x")
     assert not dest.exists()
 
-    result = claim_dest_path(dest, DT, src, dry_run=True)
+    result = claim_dest_path(dest, DT, src, primitive=copy_primitive, dry_run=True)
 
     expected = dest / "2020" / "06" / "2020-06-15 12-30-45 0001.jpg"
     assert result == expected
@@ -55,24 +61,15 @@ def test_dry_run(dest: Path, write_bytes) -> None:
     assert not dest.exists()
 
 
-@pytest.mark.xfail(
-    reason=(
-        "Production bug exposed by this test: under GNU coreutils 9.4 "
-        "`cp --no-clobber` returns rc=0 silently when the destination already "
-        "exists (only emits a portability warning on stderr).  `reflink_copy` "
-        "therefore returns True for both real copies and skipped collisions, "
-        "and `claim_dest_path` returns the same path to multiple racing "
-        "callers.  Fix in organize_media.py:reflink_copy: switch to "
-        "`--update=none-fail` (cp 9.4+) or compare inode/content after the call."
-    ),
-    strict=True,
-)
-def test_concurrent_claim(dest: Path, write_bytes) -> None:
+def test_concurrent_claim(dest: Path, write_bytes, copy_primitive) -> None:
     """20 concurrent threads each get a distinct path, all under same month dir."""
     src = write_bytes("src.jpg", data=b"shared-content")
 
     with ThreadPoolExecutor(max_workers=20) as exe:
-        futures = [exe.submit(claim_dest_path, dest, DT, src) for _ in range(20)]
+        futures = [
+            exe.submit(claim_dest_path, dest, DT, src, primitive=copy_primitive)
+            for _ in range(20)
+        ]
         results = [f.result() for f in futures]
 
     # All distinct
