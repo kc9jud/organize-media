@@ -8,7 +8,7 @@ from __future__ import annotations
 import shutil
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
+from datetime import datetime, timedelta
 from io import StringIO
 from pathlib import Path
 from typing import Callable
@@ -188,6 +188,62 @@ def test_reorganize_wrong_stem(
     # Lives in 2020/06 (correct dir) but stem prefix is 2020-06-14...
     assert placed.parent == dest / "2020" / "06"
     assert placed.name.startswith("2020-06-14 11-22-33")
+
+    reorganize(
+        dest,
+        dry_run=False,
+        verbose=False,
+        pool=pool,
+        hash_cache=hash_cache,
+        exif_cache=exif_cache,
+    )
+
+    expected = dest / "2020" / "06" / "2020-06-15 12-30-45 0001.jpg"
+    assert expected.exists()
+    assert not placed.exists()
+
+
+# ── reorganize: timezone-offset stems are left alone ─────────────────────────
+
+def test_reorganize_tz_offset_stem_not_moved(
+    dest: Path,
+    make_jpeg,
+    null_caches,
+    pool: ThreadPoolExecutor,
+    captured_console: StringIO,
+) -> None:
+    """File whose stem differs from EXIF by a clean TZ offset is not moved."""
+    hash_cache, exif_cache = null_caches
+
+    tz_stem_dt = DT - timedelta(hours=5)  # 5h before EXIF — plausible UTC offset
+    placed = place_at(make_jpeg, dest, DT, stem_dt=tz_stem_dt)
+    original_location = placed
+
+    reorganize(
+        dest,
+        dry_run=False,
+        verbose=False,
+        pool=pool,
+        hash_cache=hash_cache,
+        exif_cache=exif_cache,
+    )
+
+    assert original_location.exists()
+
+
+def test_reorganize_non_tz_offset_stem_is_moved(
+    dest: Path,
+    make_jpeg,
+    null_caches,
+    pool: ThreadPoolExecutor,
+    captured_console: StringIO,
+) -> None:
+    """File whose stem differs from EXIF by a non-TZ-shaped offset is still moved."""
+    hash_cache, exif_cache = null_caches
+
+    # 7-minute offset — not a multiple of 15 min, not a TZ offset
+    non_tz_stem_dt = DT + timedelta(minutes=7)
+    placed = place_at(make_jpeg, dest, DT, stem_dt=non_tz_stem_dt)
 
     reorganize(
         dest,

@@ -17,6 +17,7 @@ import argparse
 import os
 import re
 import sqlite3
+import warnings
 import subprocess
 import sys
 import tempfile
@@ -24,7 +25,7 @@ import threading
 from collections import defaultdict
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 try:
@@ -207,7 +208,9 @@ class ExifCache:
             from PIL import Image
             from PIL.ExifTags import IFD
             img = Image.open(path)
-            exif_data = img.getexif()
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", UserWarning)
+                exif_data = img.getexif()
             if exif_data:
                 # DateTimeOriginal (0x9003) and DateTimeDigitized (0x9004) are
                 # stored in the Exif Sub-IFD, not IFD0.  DateTime (0x0132) is
@@ -1007,18 +1010,33 @@ def _correct_path(dest_root: Path, dt: datetime, src: Path) -> tuple[Path, str]:
     return month_dir, stem_base
 
 
-_STEM_DT_RE = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}-\d{2}-\d{2})")
+_STEM_DT_RE = re.compile(r"^(\d{2,4}-\d{2}-\d{2} \d{2}-\d{2}-\d{2})")
+
+_TZ_OFFSET_MAX_S = 14 * 3600   # max real-world UTC offset (+14:00 for Kiribati)
+_TZ_OFFSET_GRAIN_S = 15 * 60   # smallest real-world increment (quarter-hour)
+
+
+def _is_tz_offset(delta: timedelta) -> bool:
+    """True when delta looks like a plausible timezone offset (≤14h, multiple of 15 min)."""
+    s = abs(delta.total_seconds())
+    return s <= _TZ_OFFSET_MAX_S and s % _TZ_OFFSET_GRAIN_S == 0
 
 
 def _parse_stem_dt(stem: str) -> datetime | None:
-    """Return the datetime encoded in a canonical filename stem, or None."""
+    """Return the datetime encoded in a filename stem, or None.
+
+    Accepts both 4-digit year (canonical) and 2-digit year (legacy tools).
+    """
     m = _STEM_DT_RE.match(stem)
     if not m:
         return None
-    try:
-        return datetime.strptime(m.group(1), "%Y-%m-%d %H-%M-%S")
-    except ValueError:
-        return None
+    token = m.group(1)
+    for fmt in ("%Y-%m-%d %H-%M-%S", "%y-%m-%d %H-%M-%S"):
+        try:
+            return datetime.strptime(token, fmt)
+        except ValueError:
+            continue
+    return None
 
 
 def _file_is_correctly_placed(
@@ -1030,18 +1048,23 @@ def _file_is_correctly_placed(
     The NNNN counter value is intentionally ignored — any counter is valid
     so long as the file is in the right directory with the right stem.
 
-    When dt_source is 'mtime', also accepts files whose existing stem already
-    encodes a valid datetime matching their parent directory — mtime is unstable
-    across syncs and copies, so we trust the filename over mtime fallback.
+    Also accepts files whose existing stem encodes any parseable datetime
+    (including 2-digit-year legacy formats) that matches their parent YYYY/MM/
+    directory — avoids re-organising files placed by other tools.
     """
     month_dir, stem_base = _correct_path(dest_root, dt, path)
     if path.parent == month_dir and path.stem.startswith(stem_base):
         return True
-    if dt_source == "mtime":
-        stem_dt = _parse_stem_dt(path.stem)
-        if stem_dt is not None:
-            stem_dir, _ = _correct_path(dest_root, stem_dt, path)
-            if path.parent == stem_dir:
+    stem_dt = _parse_stem_dt(path.stem)
+    if stem_dt is not None:
+        stem_dir, _ = _correct_path(dest_root, stem_dt, path)
+        if path.parent == stem_dir:
+            # Trust the stem when: it encodes the same datetime as EXIF
+            # (covers 2-digit-year legacy formats), the delta looks like a
+            # timezone offset (≤14h, multiple of 15 min — file was named in
+            # local time, EXIF stored/read in UTC or vice-versa), or EXIF
+            # fell back to mtime (unstable across syncs and copies).
+            if stem_dt == dt or _is_tz_offset(stem_dt - dt) or dt_source == "mtime":
                 return True
     return False
 
