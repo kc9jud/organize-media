@@ -299,14 +299,14 @@ def test_reorganize_exif_failure(
 
     boom_target = str(placed.resolve())
 
-    real_get = exif_cache.get
+    real_get_with_source = exif_cache.get_with_source
 
-    def fake_get(path: Path) -> datetime:
+    def fake_get_with_source(path: Path) -> tuple[datetime, str]:
         if str(path.resolve()) == boom_target:
             raise RuntimeError("synthetic EXIF failure")
-        return real_get(path)
+        return real_get_with_source(path)
 
-    monkeypatch.setattr(exif_cache, "get", fake_get)
+    monkeypatch.setattr(exif_cache, "get_with_source", fake_get_with_source)
 
     reorganize(
         dest,

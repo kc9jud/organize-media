@@ -27,7 +27,7 @@ No build step. No test suite. No lint config.
 ## Dependencies
 
 ```bash
-pip install pillow exifread hachoir rich
+pip install pillow pillow-heif exifread hachoir rich
 ```
 
 **Linux only.** Uses GNU `cp` and `mv`. The no-clobber semantics are chosen at runtime by `make_primitive`, which probes flag candidates in this order: `--update=none-fail` (coreutils 9.5+), `--no-clobber` with "not replacing" stderr (mv 9.4 and similar), `--no-clobber` with empty-stderr-rc!=0 (pre-9.4). If no flag-only strategy passes the probe — notably **cp on coreutils 9.4**, where every no-clobber flag returns rc=0 silently — the factory falls back to an `O_EXCL` pre-claim plus `cp -f` / `mv -f` overwriting the empty placeholder. BSD/macOS coreutils not compatible.

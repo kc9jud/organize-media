@@ -15,6 +15,7 @@ Usage:
 
 import argparse
 import os
+import re
 import sqlite3
 import subprocess
 import sys
@@ -25,6 +26,12 @@ from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
+
+try:
+    from pillow_heif import register_heif_opener as _register_heif_opener
+    _register_heif_opener()
+except ImportError:
+    pass  # HEIC/HEIF reading degraded to exifread fallback
 
 from rich.console import Console
 from rich.progress import (
@@ -134,19 +141,31 @@ class ExifCache:
         if row is not None:
             cached_mtime, cached_dt = row
             if cached_mtime == mtime:
-                return datetime.fromisoformat(cached_dt)
+                return self._normalize_dt(datetime.fromisoformat(cached_dt))
             # Stale — evict and fall through.
             with self._write_lock:
                 self._write_conn.execute(
                     "DELETE FROM exif_cache WHERE path = ?", (key,))
 
-        dt = self._get_uncached(path)
+        dt, _source = self._get_uncached(path)
         # Two threads can both reach here concurrently on the same path (both
         # saw a miss, both extracted).  The second INSERT OR REPLACE in put()
         # overwrites with an identical value — correct but redundant work.
         # Acceptable given that EXIF extraction is fast.
         self.put(path, dt)
         return dt
+
+    def get_with_source(self, path: Path) -> tuple[datetime, str]:
+        """Extract fresh (bypasses cache reads) and return (dt, source).
+
+        source is 'exif' when real metadata was found, 'mtime' when the
+        extraction fell back to the file's modification time.  The result is
+        written to the cache so future get() calls benefit.
+        Used by --reorganize to avoid moving files whose EXIF read failed.
+        """
+        dt, source = self._get_uncached(path)
+        self.put(path, dt)
+        return dt, source
 
     def put(self, path: Path, dt: datetime) -> None:
         """Insert or replace a cache entry. Does not commit (batched)."""
@@ -173,6 +192,13 @@ class ExifCache:
             except (ValueError, TypeError):
                 continue
         return None
+
+    @staticmethod
+    def _normalize_dt(dt: datetime) -> datetime:
+        """Return naive local-time datetime; convert UTC-aware datetimes first."""
+        if dt.tzinfo is not None:
+            dt = dt.astimezone().replace(tzinfo=None)
+        return dt
 
     @staticmethod
     def _dt_from_image_exif(path: Path) -> datetime | None:
@@ -245,8 +271,8 @@ class ExifCache:
         return None
 
     @classmethod
-    def _get_uncached(cls, path: Path) -> datetime:
-        """Extract datetime from EXIF/metadata; fall back to file mtime."""
+    def _get_uncached(cls, path: Path) -> tuple[datetime, str]:
+        """Extract datetime; returns (dt, source) where source is 'exif' or 'mtime'."""
         ext = path.suffix.lower()
         dt: datetime | None = None
 
@@ -256,9 +282,8 @@ class ExifCache:
             dt = cls._dt_from_video_metadata(path)
 
         if dt is None:
-            dt = datetime.fromtimestamp(path.stat().st_mtime)
-
-        return dt
+            return cls._normalize_dt(datetime.fromtimestamp(path.stat().st_mtime)), "mtime"
+        return cls._normalize_dt(dt), "exif"
 
 
 class NullExifCache(ExifCache):
@@ -268,6 +293,10 @@ class NullExifCache(ExifCache):
         pass
 
     def get(self, path: Path) -> datetime:
+        dt, _source = self._get_uncached(path)
+        return dt
+
+    def get_with_source(self, path: Path) -> tuple[datetime, str]:
         return self._get_uncached(path)
 
     def put(self, path: Path, dt: datetime) -> None:
@@ -978,15 +1007,43 @@ def _correct_path(dest_root: Path, dt: datetime, src: Path) -> tuple[Path, str]:
     return month_dir, stem_base
 
 
-def _file_is_correctly_placed(path: Path, dest_root: Path, dt: datetime) -> bool:
+_STEM_DT_RE = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}-\d{2}-\d{2})")
+
+
+def _parse_stem_dt(stem: str) -> datetime | None:
+    """Return the datetime encoded in a canonical filename stem, or None."""
+    m = _STEM_DT_RE.match(stem)
+    if not m:
+        return None
+    try:
+        return datetime.strptime(m.group(1), "%Y-%m-%d %H-%M-%S")
+    except ValueError:
+        return None
+
+
+def _file_is_correctly_placed(
+    path: Path, dest_root: Path, dt: datetime, dt_source: str = "exif"
+) -> bool:
     """
     Return True if `path` is already in the right month directory and its
     filename stem starts with the correct datetime prefix.
     The NNNN counter value is intentionally ignored — any counter is valid
     so long as the file is in the right directory with the right stem.
+
+    When dt_source is 'mtime', also accepts files whose existing stem already
+    encodes a valid datetime matching their parent directory — mtime is unstable
+    across syncs and copies, so we trust the filename over mtime fallback.
     """
     month_dir, stem_base = _correct_path(dest_root, dt, path)
-    return path.parent == month_dir and path.stem.startswith(stem_base)
+    if path.parent == month_dir and path.stem.startswith(stem_base):
+        return True
+    if dt_source == "mtime":
+        stem_dt = _parse_stem_dt(path.stem)
+        if stem_dt is not None:
+            stem_dir, _ = _correct_path(dest_root, stem_dt, path)
+            if path.parent == stem_dir:
+                return True
+    return False
 
 
 def reorganize(
@@ -1024,15 +1081,18 @@ def reorganize(
         console.print("[bold yellow]DRY RUN[/bold yellow] — no files will be moved.\n")
 
     # ── EXIF sweep: read every file (no size-based deferral) ─────────────────
-    ReorgExifResult = tuple[Path, datetime | None, Exception | None]
+    # get_with_source() bypasses cache reads so we know whether the result came
+    # from real EXIF metadata or mtime fallback.  The result is written to cache
+    # so future organize runs still benefit.
+    ReorgExifResult = tuple[Path, datetime | None, str | None, Exception | None]
 
     def read_one(path: Path, progress: Progress, task: TaskID) -> ReorgExifResult:
         progress.update(task, description=f"Reading metadata… [dim]{path.name}[/dim]")
         try:
-            dt = exif_cache.get(path)
-            return path, dt, None
+            dt, source = exif_cache.get_with_source(path)
+            return path, dt, source, None
         except Exception as exc:
-            return path, None, exc
+            return path, None, None, exc
         finally:
             progress.advance(task)
 
@@ -1047,12 +1107,14 @@ def reorganize(
     exif_cache.commit()
 
     file_dt: dict[Path, datetime] = {}
+    file_source: dict[Path, str] = {}
     exif_errors: list[tuple[Path, Exception]] = []
-    for path, dt, exc in results:
+    for path, dt, source, exc in results:
         if exc is not None:
             exif_errors.append((path, exc))
         else:
             file_dt[path] = dt
+            file_source[path] = source
 
     exif_failed: set[Path] = {p for p, _ in exif_errors}
     for path, exc in exif_errors:
@@ -1066,7 +1128,7 @@ def reorganize(
     for path, _ in sorted(items):
         if path in exif_failed:
             continue
-        if _file_is_correctly_placed(path, dest, file_dt[path]):
+        if _file_is_correctly_placed(path, dest, file_dt[path], file_source[path]):
             already_ok += 1
         else:
             misplaced.append((path, file_dt[path]))

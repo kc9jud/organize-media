@@ -70,8 +70,9 @@ def test_dt_from_video_metadata_garbage(write_bytes) -> None:
 def test_get_uncached_falls_back_to_mtime(copy_fixture) -> None:
     known_mtime = 1_600_000_000.0  # 2020-09-13 12:26:40 UTC
     path = copy_fixture("jpeg_no_exif.jpg", mtime=known_mtime)
-    dt = ExifCache._get_uncached(path)
+    dt, source = ExifCache._get_uncached(path)
     assert dt == datetime.fromtimestamp(known_mtime)
+    assert source == "mtime"
 
 
 # ── ExifCache.get happy path + persistence ────────────────────────────────────
@@ -233,9 +234,10 @@ def test_null_exif_cache_matches_get_uncached_and_is_noop(
     _, null_exif = null_caches
     path = copy_fixture("jpeg_subifd_2020.jpg")
 
-    direct = ExifCache._get_uncached(path)
+    direct, source = ExifCache._get_uncached(path)
     via_null = null_exif.get(path)
     assert direct == via_null == datetime(2020, 6, 15, 12, 30, 45)
+    assert source == "exif"
 
     # All write-side operations should be silent no-ops.
     null_exif.put(path, datetime(2020, 6, 15, 12, 30, 45))
