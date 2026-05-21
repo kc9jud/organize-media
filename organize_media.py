@@ -14,6 +14,7 @@ Usage:
 """
 
 import argparse
+import logging
 import os
 import re
 import sqlite3
@@ -34,10 +35,11 @@ try:
 except ImportError:
     pass  # HEIC/HEIF reading degraded to exifread fallback
 
-# PIL emits this UserWarning for every PNG without an EXIF chunk; it fires in
-# worker threads where warnings.catch_warnings() is not thread-safe, so filter
-# it at module level instead.
-warnings.filterwarnings("ignore", message=".*PNG file does not have exif data", category=UserWarning)
+# exifread logs "PNG file does not have exif data." at WARNING via its named
+# logger when a PNG lacks an EXIF chunk — caught and handled by _dt_from_image_exif.
+# Suppress it so it doesn't propagate to the root logger's stderr handler.
+logging.getLogger("exifread").addHandler(logging.NullHandler())
+logging.getLogger("exifread").propagate = False
 
 from rich.console import Console
 from rich.progress import (
