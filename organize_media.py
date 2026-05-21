@@ -289,9 +289,13 @@ class ExifCache:
         elif ext in VIDEO_EXTS:
             dt = cls._dt_from_video_metadata(path)
 
-        if dt is None:
-            return cls._normalize_dt(datetime.fromtimestamp(path.stat().st_mtime)), "mtime"
-        return cls._normalize_dt(dt), "exif"
+        if dt is not None:
+            dt = cls._normalize_dt(dt)
+            # Reject null-epoch sentinels — QuickTime uses 1904-01-01 and some
+            # tools emit 1970-01-01 when no creation date is recorded.
+            if dt > datetime(1970, 1, 1):
+                return dt, "exif"
+        return cls._normalize_dt(datetime.fromtimestamp(path.stat().st_mtime)), "mtime"
 
 
 class NullExifCache(ExifCache):
