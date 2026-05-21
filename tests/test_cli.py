@@ -38,7 +38,7 @@ def test_reorganize_dest_not_a_directory(tmp_path):
     dest_file = tmp_path / "not_a_dir.txt"
     dest_file.write_bytes(b"hello")
 
-    result = run_cli(str(dest_file), str(dest_file), "--reorganize")
+    result = run_cli(str(dest_file), "--reorganize")
 
     assert result.returncode != 0
     assert "Error: destination" in result.stderr

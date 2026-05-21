@@ -1138,10 +1138,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Organise media into DEST/YYYY/MM/YYYY-MM-DD hh-mm-ss NNNN.ext"
     )
-    parser.add_argument("sources", type=Path, nargs="+",
-                        help="Source directories (or the destination root when --reorganize is set)")
-    parser.add_argument("dest", type=Path,
-                        help="Destination root directory")
+    parser.add_argument("paths", type=Path, nargs="+", metavar="PATH",
+                        help="SOURCE... DEST  (or just DEST when --reorganize is set)")
     parser.add_argument("--dry-run",     action="store_true",
                         help="Preview without writing")
     parser.add_argument("--move",        action="store_true",
@@ -1149,8 +1147,7 @@ def main() -> None:
     parser.add_argument("--reorganize",  action="store_true",
                         help=(
                             "Walk DEST and move any file whose path does not match "
-                            "its EXIF metadata into the correct location. "
-                            "SOURCE arguments are ignored."
+                            "its EXIF metadata into the correct location."
                         ))
     parser.add_argument("--verbose",     action="store_true",
                         help="Print every file path")
@@ -1165,6 +1162,17 @@ def main() -> None:
                         metavar="PATH",
                         help="SQLite database for persistent hash and EXIF cache (omit to disable)")
     args = parser.parse_args()
+
+    if args.reorganize:
+        if len(args.paths) != 1:
+            parser.error("--reorganize takes exactly one positional argument: DEST")
+        args.sources = []
+        args.dest = args.paths[0]
+    else:
+        if len(args.paths) < 2:
+            parser.error("at least one SOURCE and a DEST are required")
+        args.sources = args.paths[:-1]
+        args.dest = args.paths[-1]
 
     for ex in args.exclude:
         if not ex.is_dir():
