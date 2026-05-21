@@ -34,6 +34,11 @@ try:
 except ImportError:
     pass  # HEIC/HEIF reading degraded to exifread fallback
 
+# PIL emits this UserWarning for every PNG without an EXIF chunk; it fires in
+# worker threads where warnings.catch_warnings() is not thread-safe, so filter
+# it at module level instead.
+warnings.filterwarnings("ignore", message=".*PNG file does not have exif data", category=UserWarning)
+
 from rich.console import Console
 from rich.progress import (
     BarColumn,
@@ -208,9 +213,7 @@ class ExifCache:
             from PIL import Image
             from PIL.ExifTags import IFD
             img = Image.open(path)
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore", UserWarning)
-                exif_data = img.getexif()
+            exif_data = img.getexif()
             if exif_data:
                 # DateTimeOriginal (0x9003) and DateTimeDigitized (0x9004) are
                 # stored in the Exif Sub-IFD, not IFD0.  DateTime (0x0132) is
