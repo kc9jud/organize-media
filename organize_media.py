@@ -1013,6 +1013,7 @@ def reorganize(
     # Probe and build the move primitive once, before the thread pool starts.
     primitive = make_primitive(move=True)
 
+    dest = dest.resolve()
     items = collect_media([dest])
     if not items:
         console.print("No media files found in destination.")
