@@ -231,6 +231,33 @@ def test_reorganize_tz_offset_stem_not_moved(
     assert original_location.exists()
 
 
+def test_reorganize_tz_offset_plus_drift_not_moved(
+    dest: Path,
+    make_jpeg,
+    null_caches,
+    pool: ThreadPoolExecutor,
+    captured_console: StringIO,
+) -> None:
+    """File whose stem differs from EXIF by a TZ offset plus small drift is not moved."""
+    hash_cache, exif_cache = null_caches
+
+    # 5h offset + 3s drift — within tolerance
+    tz_stem_dt = DT - timedelta(hours=5, seconds=3)
+    placed = place_at(make_jpeg, dest, DT, stem_dt=tz_stem_dt)
+    original_location = placed
+
+    reorganize(
+        dest,
+        dry_run=False,
+        verbose=False,
+        pool=pool,
+        hash_cache=hash_cache,
+        exif_cache=exif_cache,
+    )
+
+    assert original_location.exists()
+
+
 def test_reorganize_non_tz_offset_stem_is_moved(
     dest: Path,
     make_jpeg,

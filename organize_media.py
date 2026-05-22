@@ -1021,14 +1021,24 @@ def _correct_path(dest_root: Path, dt: datetime, src: Path) -> tuple[Path, str]:
 
 _STEM_DT_RE = re.compile(r"^(\d{2,4}-\d{2}-\d{2} \d{2}-\d{2}-\d{2})")
 
-_TZ_OFFSET_MAX_S = 14 * 3600   # max real-world UTC offset (+14:00 for Kiribati)
-_TZ_OFFSET_GRAIN_S = 15 * 60   # smallest real-world increment (quarter-hour)
+_TZ_OFFSET_MAX_S  = 14 * 3600  # max real-world UTC offset (+14:00 for Kiribati)
+_TZ_OFFSET_GRAIN_S = 15 * 60  # smallest real-world increment (quarter-hour)
+_STEM_DRIFT_TOLERANCE_S = 5    # sub-second rounding / encoder clock drift
 
 
-def _is_tz_offset(delta: timedelta) -> bool:
-    """True when delta looks like a plausible timezone offset (≤14h, multiple of 15 min)."""
-    s = abs(delta.total_seconds())
-    return s <= _TZ_OFFSET_MAX_S and s % _TZ_OFFSET_GRAIN_S == 0
+def _within_stem_tolerance(delta: timedelta) -> bool:
+    """True when delta is within 5 s of a plausible timezone offset (or zero).
+
+    Covers three cases that should not trigger a reorganize move:
+      - Pure clock drift / sub-second rounding (delta ≈ 0 ± 5 s)
+      - Timezone mismatch (delta ≈ N × 15 min, N × 15 min ± 5 s)
+      - Both combined (delta ≈ TZ_offset ± 5 s)
+    """
+    s = delta.total_seconds()
+    # Snap to the nearest 15-minute TZ boundary.
+    tz_s = round(s / _TZ_OFFSET_GRAIN_S) * _TZ_OFFSET_GRAIN_S
+    drift = abs(s - tz_s)
+    return abs(tz_s) <= _TZ_OFFSET_MAX_S and drift < _STEM_DRIFT_TOLERANCE_S
 
 
 def _parse_stem_dt(stem: str) -> datetime | None:
@@ -1068,12 +1078,10 @@ def _file_is_correctly_placed(
     if stem_dt is not None:
         stem_dir, _ = _correct_path(dest_root, stem_dt, path)
         if path.parent == stem_dir:
-            # Trust the stem when: it encodes the same datetime as EXIF
-            # (covers 2-digit-year legacy formats), the delta looks like a
-            # timezone offset (≤14h, multiple of 15 min — file was named in
-            # local time, EXIF stored/read in UTC or vice-versa), or EXIF
-            # fell back to mtime (unstable across syncs and copies).
-            if stem_dt == dt or _is_tz_offset(stem_dt - dt) or dt_source == "mtime":
+            # Trust the stem when the delta is within tolerance (covers exact
+            # matches, 2-digit-year reformats, TZ offsets ± 5 s of drift),
+            # or when EXIF fell back to mtime (unstable across syncs).
+            if _within_stem_tolerance(stem_dt - dt) or dt_source == "mtime":
                 return True
     return False
 
