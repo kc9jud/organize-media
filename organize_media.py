@@ -134,10 +134,17 @@ class ExifCache:
     # ── public interface ──────────────────────────────────────────────────────
 
     def get(self, path: Path) -> datetime:
-        """
-        Return the EXIF datetime for path, using the cache when valid.
-        The entry is valid when the stored mtime matches path.stat().st_mtime.
-        On a miss or stale entry, re-extracts and stores the result.
+        """Return the EXIF datetime for path, using the cache when valid."""
+        dt, _ = self.get_with_source(path)
+        return dt
+
+    def get_with_source(self, path: Path) -> tuple[datetime, str]:
+        """Return (dt, source) using the cache.
+
+        Only EXIF-derived datetimes are written to or read from the cache.
+        A cache hit always implies source='exif'.  On a cache miss the file is
+        re-extracted; if extraction falls back to mtime, the result is returned
+        as source='mtime' and is NOT cached (mtime is unstable across syncs).
         """
         key   = str(path.resolve())
         mtime = path.stat().st_mtime
@@ -149,30 +156,17 @@ class ExifCache:
         if row is not None:
             cached_mtime, cached_dt = row
             if cached_mtime == mtime:
-                return self._normalize_dt(datetime.fromisoformat(cached_dt))
+                return self._normalize_dt(datetime.fromisoformat(cached_dt)), "exif"
             # Stale — evict and fall through.
             with self._write_lock:
                 self._write_conn.execute(
                     "DELETE FROM exif_cache WHERE path = ?", (key,))
 
-        dt, _source = self._get_uncached(path)
-        # Two threads can both reach here concurrently on the same path (both
-        # saw a miss, both extracted).  The second INSERT OR REPLACE in put()
-        # overwrites with an identical value — correct but redundant work.
-        # Acceptable given that EXIF extraction is fast.
-        self.put(path, dt)
-        return dt
-
-    def get_with_source(self, path: Path) -> tuple[datetime, str]:
-        """Extract fresh (bypasses cache reads) and return (dt, source).
-
-        source is 'exif' when real metadata was found, 'mtime' when the
-        extraction fell back to the file's modification time.  The result is
-        written to the cache so future get() calls benefit.
-        Used by --reorganize to avoid moving files whose EXIF read failed.
-        """
         dt, source = self._get_uncached(path)
-        self.put(path, dt)
+        # Two threads can both reach here concurrently on the same path — the
+        # second INSERT OR REPLACE overwrites with an identical value.
+        if source == "exif":
+            self.put(path, dt)
         return dt, source
 
     def put(self, path: Path, dt: datetime) -> None:
@@ -305,7 +299,7 @@ class NullExifCache(ExifCache):
         pass
 
     def get(self, path: Path) -> datetime:
-        dt, _source = self._get_uncached(path)
+        dt, _ = self.get_with_source(path)
         return dt
 
     def get_with_source(self, path: Path) -> tuple[datetime, str]:

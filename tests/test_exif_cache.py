@@ -122,6 +122,49 @@ def test_exif_cache_get_hit_skips_extraction(caches, copy_fixture, monkeypatch) 
     assert second == datetime(2020, 6, 15, 12, 30, 45)
 
 
+# ── get_with_source: cache hit returns 'exif', skips re-extraction ────────────
+
+def test_get_with_source_cache_hit_skips_extraction(caches, copy_fixture, monkeypatch) -> None:
+    _, exif_cache, _, _ = caches
+    path = copy_fixture("jpeg_subifd_2020.jpg")
+
+    first_dt, first_src = exif_cache.get_with_source(path)
+    assert first_dt == datetime(2020, 6, 15, 12, 30, 45)
+    assert first_src == "exif"
+    exif_cache.commit()
+
+    def boom(*args, **kwargs):
+        pytest.fail("_get_uncached should not be called on a cache hit")
+
+    monkeypatch.setattr(ExifCache, "_get_uncached", boom)
+
+    second_dt, second_src = exif_cache.get_with_source(path)
+    assert second_dt == datetime(2020, 6, 15, 12, 30, 45)
+    assert second_src == "exif"
+
+
+# ── get_with_source: mtime fallback is not cached ─────────────────────────────
+
+def test_get_with_source_mtime_not_cached(caches, cache_db, copy_fixture) -> None:
+    _, exif_cache, _, _ = caches
+    path = copy_fixture("jpeg_no_exif.jpg")
+
+    dt, source = exif_cache.get_with_source(path)
+    assert source == "mtime"
+    exif_cache.commit()
+
+    fresh = sqlite3.connect(str(cache_db))
+    try:
+        row = fresh.execute(
+            "SELECT COUNT(*) FROM exif_cache WHERE path = ?",
+            (str(path.resolve()),),
+        ).fetchone()
+    finally:
+        fresh.close()
+
+    assert row[0] == 0, "mtime-fallback datetime must not be written to the cache"
+
+
 # ── ExifCache.get stale (mtime changed) ───────────────────────────────────────
 
 def test_exif_cache_get_stale_reextracts(caches, cache_db, make_jpeg, tmp_path) -> None:
