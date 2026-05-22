@@ -1168,10 +1168,19 @@ def reorganize(
     for path, _ in sorted(items):
         if path in exif_failed:
             continue
-        if _file_is_correctly_placed(path, dest, file_dt[path], file_source[path]):
+        dt = file_dt[path]
+        mtime_dt = datetime.fromtimestamp(path.stat().st_mtime)
+        if dt > mtime_dt + timedelta(seconds=5):
+            # Proposed stem is later than the file's mtime — EXIF is likely
+            # corrupt or a future-dated sentinel.  Leave the file in place.
+            if verbose:
+                console.log(f"[yellow]SKIP[/yellow]  {path}  [dim](stem {dt} > mtime {mtime_dt})[/dim]")
+            already_ok += 1
+            continue
+        if _file_is_correctly_placed(path, dest, dt, file_source[path]):
             already_ok += 1
         else:
-            misplaced.append((path, file_dt[path]))
+            misplaced.append((path, dt))
 
     if misplaced:
         console.print(f"  {len(misplaced)} file(s) need reorganising, "
