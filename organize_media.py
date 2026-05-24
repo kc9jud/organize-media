@@ -24,7 +24,7 @@ import sys
 import tempfile
 import threading
 from collections import defaultdict
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -658,6 +658,32 @@ def make_progress(*, bytes: bool = False) -> Progress:
 _SCAN_UPDATE_INTERVAL = 100  # update progress label every N filesystem entries
 
 
+def _iter_source_paths(sources: list[Path]) -> Iterator[Path]:
+    """Yield every Path implied by sources.
+
+    A source that is a file is yielded directly. A directory is walked
+    recursively via rglob("*"). The literal token Path("-") reads
+    newline-separated paths from stdin and yields each as a file or the
+    recursive walk of a directory.
+    """
+    for source in sources:
+        if str(source) == "-":
+            for raw in sys.stdin:
+                line = raw.strip()
+                if not line:
+                    continue
+                p = Path(line)
+                if p.is_file():
+                    yield p
+                elif p.is_dir():
+                    yield from p.rglob("*")
+                # else: silently skipped — matches OSError tolerance below
+        elif source.is_file():
+            yield source
+        else:
+            yield from source.rglob("*")
+
+
 def collect_media(sources: list[Path]) -> list[tuple[Path, int]]:
     """
     Walk sources recursively and return (resolved_path, size) for every
@@ -670,18 +696,17 @@ def collect_media(sources: list[Path]) -> list[tuple[Path, int]]:
         task = progress.add_task("Scanning…", total=None)
         found: list[tuple[Path, int]] = []
         seen: int = 0
-        for source in sources:
-            for p in source.rglob("*"):
-                seen += 1
-                if p.is_file() and p.suffix.lower() in ALL_EXTS:
-                    try:
-                        found.append((p.resolve(), p.stat().st_size))
-                    except OSError:
-                        pass  # file vanished between rglob and stat
-                    # Update on every media file found until the throttle
-                    # kicks in, so small directories always show a filename.
-                    if len(found) <= _SCAN_UPDATE_INTERVAL or seen % _SCAN_UPDATE_INTERVAL == 0:
-                        progress.update(task, description=f"Scanning… [dim]{p.name}[/dim]")
+        for p in _iter_source_paths(sources):
+            seen += 1
+            if p.is_file() and p.suffix.lower() in ALL_EXTS:
+                try:
+                    found.append((p.resolve(), p.stat().st_size))
+                except OSError:
+                    pass  # file vanished between rglob and stat
+                # Update on every media file found until the throttle
+                # kicks in, so small directories always show a filename.
+                if len(found) <= _SCAN_UPDATE_INTERVAL or seen % _SCAN_UPDATE_INTERVAL == 0:
+                    progress.update(task, description=f"Scanning… [dim]{p.name}[/dim]")
     return found
 
 
@@ -1245,7 +1270,12 @@ def main() -> None:
         description="Organise media into DEST/YYYY/MM/YYYY-MM-DD hh-mm-ss NNNN.ext"
     )
     parser.add_argument("paths", type=Path, nargs="+", metavar="PATH",
-                        help="SOURCE... DEST  (or just DEST when --reorganize is set)")
+                        help=(
+                            "SOURCE... DEST  (or just DEST when --reorganize is set). "
+                            "Use '-' as the sole SOURCE to read newline-separated paths "
+                            "(files or directories) from stdin. Use '--' to separate paths "
+                            "from flags when needed (e.g. '-- - DEST')."
+                        ))
     parser.add_argument("--dry-run",     action="store_true",
                         help="Preview without writing")
     parser.add_argument("--move",        action="store_true",
@@ -1270,6 +1300,8 @@ def main() -> None:
     args = parser.parse_args()
 
     if args.reorganize:
+        if any(str(p) == "-" for p in args.paths):
+            parser.error("--reorganize does not accept '-' as a source")
         if len(args.paths) != 1:
             parser.error("--reorganize takes exactly one positional argument: DEST")
         args.sources = []
@@ -1280,6 +1312,12 @@ def main() -> None:
         args.sources = args.paths[:-1]
         args.dest = args.paths[-1]
 
+    if any(str(s) == "-" for s in args.sources):
+        if len(args.sources) != 1:
+            parser.error("'-' must be the only source (mutually exclusive with path sources)")
+        if sys.stdin.isatty():
+            sys.exit("Error: '-' source given but stdin is a TTY (no piped input).")
+
     for ex in args.exclude:
         if not ex.is_dir():
             sys.exit(f"Error: --exclude '{ex}' is not a directory.")
@@ -1289,6 +1327,8 @@ def main() -> None:
             sys.exit(f"Error: destination '{args.dest}' is not a directory.")
     else:
         for src in args.sources:
+            if str(src) == "-":
+                continue  # stdin sentinel — contents validated lazily in _iter_source_paths
             if not src.is_dir():
                 sys.exit(f"Error: source '{src}' is not a directory.")
         if not args.dry_run:

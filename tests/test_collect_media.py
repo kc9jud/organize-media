@@ -1,14 +1,15 @@
-"""Tests for organize_media.collect_media (organize_media.py:518-542)."""
+"""Tests for organize_media.collect_media and _iter_source_paths."""
 
 from __future__ import annotations
 
+import io
 import os
 from pathlib import Path
 
 import pytest
 
 import organize_media
-from organize_media import collect_media
+from organize_media import collect_media, _iter_source_paths
 
 
 def _resolved_sorted(results: list[tuple[Path, int]]) -> list[tuple[Path, int]]:
@@ -122,3 +123,59 @@ def test_returned_paths_are_absolute(tmp_path, write_bytes, monkeypatch) -> None
     assert len(result) == 1
     for p, _ in result:
         assert p.is_absolute(), f"expected absolute path, got {p!r}"
+
+
+# ── _iter_source_paths ────────────────────────────────────────────────────────
+
+
+def test_iter_file_source(write_bytes) -> None:
+    f = write_bytes("img.jpg", size=10)
+    assert list(_iter_source_paths([f])) == [f]
+
+
+def test_iter_dir_source(tmp_path, write_bytes) -> None:
+    a = write_bytes("a.jpg", size=1)
+    b = write_bytes("b.jpg", size=2, into=tmp_path / "sub")
+    result = set(_iter_source_paths([tmp_path]))
+    assert a in result
+    assert b in result
+
+
+def test_iter_stdin_files(tmp_path, write_bytes, monkeypatch) -> None:
+    a = write_bytes("a.jpg", size=1)
+    b = write_bytes("b.jpg", size=2)
+    monkeypatch.setattr("sys.stdin", io.StringIO(f"{a}\n{b}\n"))
+    result = list(_iter_source_paths([Path("-")]))
+    assert set(result) == {a, b}
+
+
+def test_iter_stdin_dir_walks_recursively(tmp_path, write_bytes, monkeypatch) -> None:
+    a = write_bytes("a.jpg", size=1)
+    b = write_bytes("b.jpg", size=2, into=tmp_path / "sub")
+    monkeypatch.setattr("sys.stdin", io.StringIO(f"{tmp_path}\n"))
+    result = set(_iter_source_paths([Path("-")]))
+    assert a in result
+    assert b in result
+
+
+def test_iter_stdin_empty_lines_skipped(tmp_path, write_bytes, monkeypatch) -> None:
+    f = write_bytes("x.jpg", size=5)
+    monkeypatch.setattr("sys.stdin", io.StringIO(f"\n  \n{f}\n\n"))
+    result = list(_iter_source_paths([Path("-")]))
+    assert result == [f]
+
+
+def test_iter_stdin_nonexistent_skipped(tmp_path, monkeypatch) -> None:
+    ghost = tmp_path / "ghost.jpg"
+    monkeypatch.setattr("sys.stdin", io.StringIO(f"{ghost}\n"))
+    assert list(_iter_source_paths([Path("-")])) == []
+
+
+def test_iter_stdin_mixed_file_and_dir(tmp_path, write_bytes, monkeypatch) -> None:
+    f = write_bytes("direct.jpg", size=1)
+    nested = write_bytes("nested.jpg", size=2, into=tmp_path / "sub")
+    sub = tmp_path / "sub"
+    monkeypatch.setattr("sys.stdin", io.StringIO(f"{f}\n{sub}\n"))
+    result = set(_iter_source_paths([Path("-")]))
+    assert f in result
+    assert nested in result

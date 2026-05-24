@@ -12,6 +12,10 @@ Single-file Python CLI (`organize_media.py`) that copies/moves images and videos
 # Copy media from SOURCE(s) to DEST
 python organize_media.py SOURCE [SOURCE ...] DEST [OPTIONS]
 
+# Read paths (files or dirs) from stdin; '-' must be the sole source.
+# Use '--' to separate the literal '-' from flags.
+find ~/incoming -type f -newer LASTRUN | python organize_media.py -- - DEST
+
 # Key options
 --dry-run           # Preview without writing
 --move              # Move instead of copy
@@ -22,7 +26,7 @@ python organize_media.py SOURCE [SOURCE ...] DEST [OPTIONS]
 --verbose           # Log every file operation
 ```
 
-No build step. No test suite. No lint config.
+No build step. No lint config. Run tests with `uv run python -m pytest` (requires `uv sync --extra test`).
 
 ## Dependencies
 
